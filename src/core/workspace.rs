@@ -4,14 +4,16 @@
 //! 1. Detect workspace roots by walking up the directory tree
 //! 2. Parse workspace configuration ([workspace.package] and [workspace.dependencies])
 //! 3. Resolve inherited values from workspace root
+//! 4. Discover all workspace members (with glob pattern support)
 
 use anyhow::{Context, Result};
+use glob::glob;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::manifest::DependencySpec;
+use super::manifest::{DependencySpec, Manifest};
 
 /// Represents a parsed workspace root Cargo.toml
 #[derive(Debug, Clone)]
@@ -147,6 +149,86 @@ impl WorkspaceRoot {
     /// Get the version string for a workspace dependency
     pub fn get_dependency_version(&self, name: &str) -> Option<&str> {
         self.get_dependency(name)?.version()
+    }
+
+    /// Get the workspace root directory
+    pub fn root_dir(&self) -> &Path {
+        self.path.parent().unwrap_or(&self.path)
+    }
+
+    /// Discover all workspace member directories by expanding glob patterns
+    ///
+    /// Workspace members can be specified as:
+    /// - Exact paths: "member1", "crates/foo"
+    /// - Glob patterns: "crates/*", "packages/*"
+    pub fn discover_member_paths(&self) -> Result<Vec<PathBuf>> {
+        let root_dir = self.root_dir();
+        let mut member_paths = Vec::new();
+
+        for pattern in &self.members {
+            let full_pattern = root_dir.join(pattern);
+            let pattern_str = full_pattern.to_string_lossy();
+
+            // Check if this is a glob pattern or a direct path
+            if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
+                // Expand glob pattern
+                for entry in glob(&pattern_str)
+                    .with_context(|| format!("Invalid glob pattern: {}", pattern))?
+                {
+                    match entry {
+                        Ok(path) => {
+                            if path.is_dir() && path.join("Cargo.toml").exists() {
+                                member_paths.push(path);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: Failed to read glob entry: {}", e);
+                        }
+                    }
+                }
+            } else {
+                // Direct path
+                let member_dir = root_dir.join(pattern);
+                if member_dir.is_dir() && member_dir.join("Cargo.toml").exists() {
+                    member_paths.push(member_dir);
+                }
+            }
+        }
+
+        // Sort for consistent ordering
+        member_paths.sort();
+        Ok(member_paths)
+    }
+
+    /// Get all member manifests in the workspace
+    pub fn get_member_manifests(&self) -> Result<Vec<Manifest>> {
+        let member_paths = self.discover_member_paths()?;
+        let mut manifests = Vec::new();
+
+        for path in member_paths {
+            let manifest_path = path.join("Cargo.toml");
+            match Manifest::from_path(&manifest_path) {
+                Ok(manifest) => manifests.push(manifest),
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to parse {}: {}",
+                        manifest_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(manifests)
+    }
+
+    /// Check if the workspace root itself is also a package (has [package] section)
+    pub fn is_also_package(&self) -> bool {
+        let content = match fs::read_to_string(&self.path) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        content.contains("[package]")
     }
 }
 
@@ -344,5 +426,116 @@ serde = "1.0"
 
         assert!(context.is_workspace());
         assert!(context.is_root_manifest());
+    }
+
+    #[test]
+    fn test_discover_member_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        let (root_toml, _) = create_workspace_structure(&temp_dir);
+
+        // Create member2 directory
+        let member2_dir = temp_dir.path().join("member2");
+        fs::create_dir_all(&member2_dir).unwrap();
+        fs::write(
+            member2_dir.join("Cargo.toml"),
+            r#"[package]
+name = "member2"
+version = "0.1.0"
+"#,
+        )
+        .unwrap();
+
+        let workspace = WorkspaceRoot::find(&root_toml)
+            .expect("Should not error")
+            .expect("Should find workspace");
+
+        let members = workspace.discover_member_paths().expect("Should discover members");
+
+        assert_eq!(members.len(), 2);
+        assert!(members.iter().any(|p| p.ends_with("member1")));
+        assert!(members.iter().any(|p| p.ends_with("member2")));
+    }
+
+    #[test]
+    fn test_discover_member_paths_with_glob() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create workspace with glob pattern
+        let root_toml = temp_dir.path().join("Cargo.toml");
+        fs::write(
+            &root_toml,
+            r#"
+[workspace]
+members = ["crates/*"]
+"#,
+        )
+        .unwrap();
+
+        // Create crates directory with multiple members
+        let crates_dir = temp_dir.path().join("crates");
+        fs::create_dir_all(&crates_dir).unwrap();
+
+        for name in ["foo", "bar", "baz"] {
+            let crate_dir = crates_dir.join(name);
+            fs::create_dir_all(&crate_dir).unwrap();
+            fs::write(
+                crate_dir.join("Cargo.toml"),
+                format!(
+                    r#"[package]
+name = "{}"
+version = "0.1.0"
+"#,
+                    name
+                ),
+            )
+            .unwrap();
+        }
+
+        let workspace = WorkspaceRoot::find(&root_toml)
+            .expect("Should not error")
+            .expect("Should find workspace");
+
+        let members = workspace.discover_member_paths().expect("Should discover members");
+
+        assert_eq!(members.len(), 3);
+        assert!(members.iter().any(|p| p.ends_with("foo")));
+        assert!(members.iter().any(|p| p.ends_with("bar")));
+        assert!(members.iter().any(|p| p.ends_with("baz")));
+    }
+
+    #[test]
+    fn test_get_member_manifests() {
+        let temp_dir = TempDir::new().unwrap();
+        let (root_toml, _) = create_workspace_structure(&temp_dir);
+
+        // Create member2
+        let member2_dir = temp_dir.path().join("member2");
+        fs::create_dir_all(&member2_dir).unwrap();
+        fs::write(
+            member2_dir.join("Cargo.toml"),
+            r#"[package]
+name = "member2"
+version = "0.1.0"
+
+[dependencies]
+log = "0.4"
+"#,
+        )
+        .unwrap();
+
+        let workspace = WorkspaceRoot::find(&root_toml)
+            .expect("Should not error")
+            .expect("Should find workspace");
+
+        let manifests = workspace.get_member_manifests().expect("Should get manifests");
+
+        assert_eq!(manifests.len(), 2);
+
+        let names: Vec<_> = manifests
+            .iter()
+            .filter_map(|m| m.package_name())
+            .collect();
+        assert!(names.contains(&"member1"));
+        assert!(names.contains(&"member2"));
     }
 }

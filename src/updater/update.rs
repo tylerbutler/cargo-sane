@@ -84,7 +84,7 @@ impl DependencyUpdater {
     }
 
     /// Update a version string in TOML content using regex
-    fn update_version_in_content(
+    pub fn update_version_in_content(
         content: &str,
         dep_name: &str,
         new_version: &str,

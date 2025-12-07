@@ -27,6 +27,10 @@ enum Commands {
         /// Show detailed information
         #[arg(short, long)]
         verbose: bool,
+
+        /// Analyze all workspace members
+        #[arg(short, long)]
+        workspace: bool,
     },
 
     /// Update dependencies interactively
@@ -43,6 +47,10 @@ enum Commands {
         /// Update all dependencies without prompting
         #[arg(short, long)]
         all: bool,
+
+        /// Update all workspace members
+        #[arg(short, long)]
+        workspace: bool,
     },
 
     /// Fix dependency conflicts
@@ -102,12 +110,14 @@ fn main() -> Result<()> {
         Commands::Check {
             manifest_path,
             verbose,
-        } => commands::check_command(manifest_path, verbose),
+            workspace,
+        } => commands::check_command(manifest_path, verbose, workspace),
         Commands::Update {
             manifest_path,
             dry_run,
             all,
-        } => commands::update_command(manifest_path, dry_run, all),
+            workspace,
+        } => commands::update_command(manifest_path, dry_run, all, workspace),
         Commands::Fix {
             manifest_path,
             auto,
