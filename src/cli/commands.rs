@@ -4,6 +4,7 @@ use crate::analyzer::checker::DependencyChecker;
 use crate::cli::output;
 use crate::core::dependency::{Dependency, UpdateType};
 use crate::core::manifest::Manifest;
+use crate::core::workspace::WorkspaceContext;
 use crate::updater::DependencyUpdater;
 use crate::Result;
 use colored::Colorize;
@@ -20,6 +21,17 @@ pub fn check_command(manifest_path: Option<String>, verbose: bool) -> Result<()>
         output::print_info(&format!("Package: {}", name));
     }
     output::print_info(&format!("Manifest: {}", manifest.path.display()));
+
+    // Check for workspace context
+    let workspace_ctx = WorkspaceContext::new(&manifest.path)?;
+    if workspace_ctx.is_workspace() {
+        if let Some(root_path) = workspace_ctx.workspace_root_path() {
+            output::print_info(&format!(
+                "Workspace: {}",
+                root_path.parent().unwrap_or(root_path).display()
+            ));
+        }
+    }
     println!();
 
     // Check dependencies
@@ -71,9 +83,15 @@ pub fn check_command(manifest_path: Option<String>, verbose: bool) -> Result<()>
         println!("{}", "🟢 Patch updates:".green().bold());
         for dep in &patch_updates {
             if let Some(latest) = &dep.latest_version {
+                let ws_marker = if dep.is_workspace_inherited {
+                    " [workspace]".dimmed().to_string()
+                } else {
+                    String::new()
+                };
                 println!(
-                    "  • {} {} → {}",
+                    "  • {}{} {} → {}",
                     dep.name.bold(),
+                    ws_marker,
                     dep.current_version.to_string().dimmed(),
                     latest.to_string().green()
                 );
@@ -90,9 +108,15 @@ pub fn check_command(manifest_path: Option<String>, verbose: bool) -> Result<()>
         println!("{}", "🟡 Minor updates:".yellow().bold());
         for dep in &minor_updates {
             if let Some(latest) = &dep.latest_version {
+                let ws_marker = if dep.is_workspace_inherited {
+                    " [workspace]".dimmed().to_string()
+                } else {
+                    String::new()
+                };
                 println!(
-                    "  • {} {} → {}",
+                    "  • {}{} {} → {}",
                     dep.name.bold(),
+                    ws_marker,
                     dep.current_version.to_string().dimmed(),
                     latest.to_string().yellow()
                 );
@@ -109,9 +133,15 @@ pub fn check_command(manifest_path: Option<String>, verbose: bool) -> Result<()>
         println!("{}", "🔴 Major updates:".red().bold());
         for dep in &major_updates {
             if let Some(latest) = &dep.latest_version {
+                let ws_marker = if dep.is_workspace_inherited {
+                    " [workspace]".dimmed().to_string()
+                } else {
+                    String::new()
+                };
                 println!(
-                    "  • {} {} → {}",
+                    "  • {}{} {} → {}",
                     dep.name.bold(),
+                    ws_marker,
                     dep.current_version.to_string().dimmed(),
                     latest.to_string().red()
                 );
@@ -159,6 +189,17 @@ pub fn update_command(manifest_path: Option<String>, dry_run: bool, all: bool) -
         output::print_info(&format!("Package: {}", name));
     }
     output::print_info(&format!("Manifest: {}", manifest.path.display()));
+
+    // Check for workspace context
+    let workspace_ctx = WorkspaceContext::new(&manifest.path)?;
+    if workspace_ctx.is_workspace() {
+        if let Some(root_path) = workspace_ctx.workspace_root_path() {
+            output::print_info(&format!(
+                "Workspace: {}",
+                root_path.parent().unwrap_or(root_path).display()
+            ));
+        }
+    }
     println!();
 
     // Check dependencies
@@ -192,6 +233,7 @@ pub fn update_command(manifest_path: Option<String>, dry_run: bool, all: bool) -
 
     // Show what will be updated
     println!("\n{}", "📝 Updates to apply:".bold());
+    let has_workspace_deps = to_update.iter().any(|d| d.is_workspace_inherited);
     for dep in &to_update {
         if let Some(latest) = &dep.latest_version {
             let update_type = match dep.update_type() {
@@ -200,14 +242,27 @@ pub fn update_command(manifest_path: Option<String>, dry_run: bool, all: bool) -
                 UpdateType::Major => "🔴 MAJOR",
                 UpdateType::UpToDate => "✅ UP-TO-DATE",
             };
+            let ws_marker = if dep.is_workspace_inherited {
+                " [workspace]".dimmed().to_string()
+            } else {
+                String::new()
+            };
             println!(
-                "  {} {} {} → {}",
+                "  {} {}{} {} → {}",
                 update_type,
                 dep.name.bold(),
+                ws_marker,
                 dep.current_version.to_string().dimmed(),
                 latest.to_string().cyan()
             );
         }
+    }
+    if has_workspace_deps {
+        println!(
+            "\n{}",
+            "Note: [workspace] dependencies will be updated in the workspace root Cargo.toml"
+                .dimmed()
+        );
     }
     println!();
 
@@ -252,10 +307,20 @@ pub fn update_command(manifest_path: Option<String>, dry_run: bool, all: bool) -
     }
 
     // Save changes
+    let workspace_modified = updater.workspace_modified();
+    let workspace_path = updater.workspace_root_path().cloned();
     updater.save()?;
     println!();
     output::print_success("Cargo.toml updated successfully!");
     output::print_info("Backup saved as Cargo.toml.backup");
+    if workspace_modified {
+        if let Some(path) = workspace_path {
+            output::print_info(&format!(
+                "Workspace root backup saved as {}",
+                path.with_extension("toml.backup").display()
+            ));
+        }
+    }
     println!();
     println!(
         "{}",
@@ -276,10 +341,16 @@ fn select_dependencies_to_update<'a>(deps: &[&'a Dependency]) -> Result<Vec<&'a 
                 UpdateType::Major => "🔴",
                 UpdateType::UpToDate => "✅",
             };
+            let ws_marker = if d.is_workspace_inherited {
+                " [ws]"
+            } else {
+                ""
+            };
             format!(
-                "{} {} {} → {}",
+                "{} {}{} {} → {}",
                 update_type,
                 d.name,
+                ws_marker,
                 d.current_version,
                 d.latest_version.as_ref().unwrap()
             )

@@ -56,8 +56,12 @@ pub struct Package {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum DependencySpec {
+    /// Simple version string: `serde = "1.0"`
     Simple(String),
+    /// Detailed dependency: `serde = { version = "1.0", features = ["derive"] }`
     Detailed(DetailedDependency),
+    /// Workspace inherited: `serde.workspace = true`
+    Workspace { workspace: bool },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -131,6 +135,7 @@ impl DependencySpec {
         match self {
             DependencySpec::Simple(v) => Some(v.as_str()),
             DependencySpec::Detailed(d) => d.version.as_deref(),
+            DependencySpec::Workspace { .. } => None,
         }
     }
 
@@ -139,6 +144,7 @@ impl DependencySpec {
         match self {
             DependencySpec::Simple(_) => false,
             DependencySpec::Detailed(d) => d.git.is_some(),
+            DependencySpec::Workspace { .. } => false,
         }
     }
 
@@ -147,12 +153,18 @@ impl DependencySpec {
         match self {
             DependencySpec::Simple(_) => false,
             DependencySpec::Detailed(d) => d.path.is_some(),
+            DependencySpec::Workspace { .. } => false,
         }
     }
 
-    /// Check if this is from crates.io (not git or path)
+    /// Check if this dependency inherits from workspace
+    pub fn is_workspace(&self) -> bool {
+        matches!(self, DependencySpec::Workspace { workspace: true })
+    }
+
+    /// Check if this is from crates.io (not git, path, or workspace-inherited)
     pub fn is_crates_io(&self) -> bool {
-        !self.is_git() && !self.is_path()
+        !self.is_git() && !self.is_path() && !self.is_workspace()
     }
 }
 

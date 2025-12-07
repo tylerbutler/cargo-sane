@@ -9,6 +9,8 @@ pub struct Dependency {
     pub current_version: Version,
     pub latest_version: Option<Version>,
     pub is_direct: bool,
+    /// Whether this dependency inherits from workspace.dependencies
+    pub is_workspace_inherited: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,11 +28,17 @@ impl Dependency {
             current_version,
             latest_version: None,
             is_direct,
+            is_workspace_inherited: false,
         }
     }
 
     pub fn with_latest(mut self, latest: Version) -> Self {
         self.latest_version = Some(latest);
+        self
+    }
+
+    pub fn with_workspace_inherited(mut self, inherited: bool) -> Self {
+        self.is_workspace_inherited = inherited;
         self
     }
 
