@@ -22,10 +22,35 @@ pub struct ManifestContent {
     pub build_dependencies: Option<HashMap<String, DependencySpec>>,
 }
 
+/// Represents a field that can either be a value or inherited from workspace
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum InheritableField<T> {
+    Value(T),
+    Workspace { workspace: bool },
+}
+
+impl<T> InheritableField<T> {
+    /// Get the value if it's a direct value (not workspace-inherited)
+    pub fn as_value(&self) -> Option<&T> {
+        match self {
+            InheritableField::Value(v) => Some(v),
+            InheritableField::Workspace { .. } => None,
+        }
+    }
+
+    /// Check if this field is inherited from workspace
+    pub fn is_workspace(&self) -> bool {
+        matches!(self, InheritableField::Workspace { .. })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Package {
     pub name: String,
-    pub version: String,
+    pub version: InheritableField<String>,
+    #[serde(default)]
+    pub edition: Option<InheritableField<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -128,5 +153,74 @@ impl DependencySpec {
     /// Check if this is from crates.io (not git or path)
     pub fn is_crates_io(&self) -> bool {
         !self.is_git() && !self.is_path()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_parse_workspace_inherited_version() {
+        // Create a temp directory and file with workspace inheritance
+        let temp_dir = TempDir::new().unwrap();
+        let manifest_path = temp_dir.path().join("Cargo.toml");
+
+        let toml_content = r#"
+[package]
+name = "test-package"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = "1.0"
+"#;
+
+        fs::write(&manifest_path, toml_content).unwrap();
+
+        // This should not panic or fail - it should parse successfully
+        let result = Manifest::from_path(&manifest_path);
+
+        assert!(
+            result.is_ok(),
+            "Should parse workspace-inherited fields without error"
+        );
+
+        let manifest = result.unwrap();
+        assert_eq!(manifest.package_name(), Some("test-package"));
+    }
+
+    #[test]
+    fn test_parse_workspace_inherited_dependency() {
+        let temp_dir = TempDir::new().unwrap();
+        let manifest_path = temp_dir.path().join("Cargo.toml");
+
+        let toml_content = r#"
+[package]
+name = "test-package"
+version = "0.1.0"
+
+[dependencies]
+serde.workspace = true
+tokio = "1.0"
+"#;
+
+        fs::write(&manifest_path, toml_content).unwrap();
+
+        // This should parse successfully
+        let result = Manifest::from_path(&manifest_path);
+
+        assert!(
+            result.is_ok(),
+            "Should parse workspace-inherited dependencies"
+        );
+
+        let manifest = result.unwrap();
+        let deps = manifest.get_dependencies();
+
+        // Should have 2 dependencies
+        assert_eq!(deps.len(), 2);
     }
 }
