@@ -10,8 +10,11 @@ use crate::Result;
 use anyhow::Context;
 use colored::Colorize;
 use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect};
+use indicatif::MultiProgress;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 /// Tracks which member manifest uses a particular dependency
 #[derive(Debug, Clone)]
@@ -145,62 +148,93 @@ fn check_workspace(workspace_ctx: &WorkspaceContext, verbose: bool) -> Result<()
     Ok(())
 }
 
-/// Aggregate dependencies across all workspace members
+/// Aggregate dependencies across all workspace members (parallel processing)
 fn aggregate_workspace_deps(
     members: &[Manifest],
     checker: &DependencyChecker,
     workspace_ctx: &WorkspaceContext,
 ) -> Result<HashMap<String, AggregatedDep>> {
-    let mut aggregated: HashMap<String, AggregatedDep> = HashMap::new();
+    // Use a Mutex-wrapped HashMap for thread-safe aggregation
+    let aggregated: Mutex<HashMap<String, AggregatedDep>> = Mutex::new(HashMap::new());
+    let warnings: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-    for manifest in members {
-        let package_name = manifest
-            .package_name()
-            .unwrap_or("unknown")
-            .to_string();
+    // Create MultiProgress for coordinated progress bar display
+    let multi_progress = MultiProgress::new();
 
-        let deps = checker.check_dependencies_with_context(manifest, workspace_ctx)?;
+    // Process workspace members in parallel with coordinated progress bars
+    let errors: Vec<_> = members
+        .par_iter()
+        .filter_map(|manifest| {
+            let package_name = manifest.package_name().unwrap_or("unknown").to_string();
 
-        for dep in deps {
-            let key = dep.name.clone();
-            let is_workspace_inherited = dep.is_workspace_inherited;
-            let manifest_path = manifest.path.clone();
+            // Check dependencies with MultiProgress support
+            let deps = match checker.check_dependencies_with_progress(
+                manifest,
+                workspace_ctx,
+                Some(&multi_progress),
+                Some(&package_name),
+            ) {
+                Ok(d) => d,
+                Err(e) => return Some(e),
+            };
 
-            aggregated
-                .entry(key)
-                .and_modify(|agg| {
-                    agg.used_by.push(package_name.clone());
-                    // Track member manifests for non-workspace deps
-                    if !is_workspace_inherited {
-                        agg.member_manifests.push(MemberDepInfo {
-                            package_name: package_name.clone(),
-                            manifest_path: manifest_path.clone(),
-                        });
-                    }
-                    // Keep the one with update info if available
-                    if dep.latest_version.is_some() && agg.dep.latest_version.is_none() {
-                        agg.dep = dep.clone();
-                    }
-                })
-                .or_insert_with(|| {
-                    let member_manifests = if is_workspace_inherited {
-                        vec![]
-                    } else {
-                        vec![MemberDepInfo {
-                            package_name: package_name.clone(),
-                            manifest_path: manifest_path.clone(),
-                        }]
-                    };
-                    AggregatedDep {
-                        dep,
-                        used_by: vec![package_name.clone()],
-                        member_manifests,
-                    }
-                });
-        }
+            // Aggregate results - lock only during HashMap updates
+            let mut agg = aggregated.lock().unwrap();
+            for dep in deps {
+                let key = dep.name.clone();
+                let is_workspace_inherited = dep.is_workspace_inherited;
+                let manifest_path = manifest.path.clone();
+
+                agg.entry(key)
+                    .and_modify(|entry| {
+                        entry.used_by.push(package_name.clone());
+                        // Track member manifests for non-workspace deps
+                        if !is_workspace_inherited {
+                            entry.member_manifests.push(MemberDepInfo {
+                                package_name: package_name.clone(),
+                                manifest_path: manifest_path.clone(),
+                            });
+                        }
+                        // Keep the one with update info if available
+                        if dep.latest_version.is_some() && entry.dep.latest_version.is_none() {
+                            entry.dep = dep.clone();
+                        }
+                    })
+                    .or_insert_with(|| {
+                        let member_manifests = if is_workspace_inherited {
+                            vec![]
+                        } else {
+                            vec![MemberDepInfo {
+                                package_name: package_name.clone(),
+                                manifest_path: manifest_path.clone(),
+                            }]
+                        };
+                        AggregatedDep {
+                            dep,
+                            used_by: vec![package_name.clone()],
+                            member_manifests,
+                        }
+                    });
+            }
+
+            None
+        })
+        .collect();
+
+    // Clear all progress bars
+    multi_progress.clear().ok();
+
+    // Print any collected warnings
+    for warning in warnings.into_inner().unwrap() {
+        eprintln!("{}", warning);
     }
 
-    Ok(aggregated)
+    // Return first error if any occurred
+    if let Some(err) = errors.into_iter().next() {
+        return Err(err);
+    }
+
+    Ok(aggregated.into_inner().unwrap())
 }
 
 fn print_dependency_summary(dependencies: &[Dependency], verbose: bool) {

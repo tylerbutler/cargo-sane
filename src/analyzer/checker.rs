@@ -5,8 +5,10 @@ use crate::core::manifest::{DependencySpec, Manifest};
 use crate::core::workspace::WorkspaceContext;
 use crate::utils::crates_io::CratesIoClient;
 use crate::Result;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use semver::Version;
+use std::sync::Mutex;
 
 pub struct DependencyChecker {
     client: CratesIoClient,
@@ -32,92 +34,138 @@ impl DependencyChecker {
         manifest: &Manifest,
         workspace_ctx: &WorkspaceContext,
     ) -> Result<Vec<Dependency>> {
+        self.check_dependencies_with_progress(manifest, workspace_ctx, None, None)
+    }
+
+    /// Analyze dependencies with optional MultiProgress support for workspace mode
+    ///
+    /// When `multi_progress` is provided, the progress bar is added to it for coordinated display.
+    /// The `package_name` is used as a prefix in workspace mode to identify which package is being checked.
+    pub fn check_dependencies_with_progress(
+        &self,
+        manifest: &Manifest,
+        workspace_ctx: &WorkspaceContext,
+        multi_progress: Option<&MultiProgress>,
+        package_name: Option<&str>,
+    ) -> Result<Vec<Dependency>> {
         let deps = manifest.get_dependencies();
-        let mut results = Vec::new();
 
         if deps.is_empty() {
-            return Ok(results);
+            return Ok(Vec::new());
         }
 
-        // Create progress bar
-        let pb = ProgressBar::new(deps.len() as u64);
+        // Create progress bar - either standalone or attached to MultiProgress
+        let pb = match multi_progress {
+            Some(mp) => mp.add(ProgressBar::new(deps.len() as u64)),
+            None => ProgressBar::new(deps.len() as u64),
+        };
+
+        // Use package name in template if provided (workspace mode)
+        let template = match package_name {
+            Some(name) => format!(
+                "{{spinner:.green}} [{{elapsed_precise}}] [{{bar:30.cyan/blue}}] {{pos}}/{{len}} {} ",
+                name
+            ),
+            None => "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} checking dependencies...".to_string(),
+        };
+
         pb.set_style(
             ProgressStyle::default_bar()
-                .template(
-                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}",
-                )
+                .template(&template)
                 .expect("Failed to set progress style")
                 .progress_chars("#>-"),
         );
 
-        for (name, spec) in deps {
-            pb.set_message(format!("Checking {}", name));
+        // Collect warnings to print after progress bars (avoid interleaving)
+        let warnings: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-            // Skip git and path dependencies (but not workspace - we can resolve those)
-            if spec.is_git() || spec.is_path() {
-                pb.inc(1);
-                continue;
-            }
+        // Prepare dependency info for parallel processing
+        let dep_infos: Vec<_> = deps
+            .into_iter()
+            .filter_map(|(name, spec)| {
+                // Skip git and path dependencies (but not workspace - we can resolve those)
+                if spec.is_git() || spec.is_path() {
+                    pb.inc(1);
+                    return None;
+                }
 
-            // Get current version - resolve from workspace if needed
-            let version_str = match self.resolve_version(&name, &spec, workspace_ctx) {
-                Some(v) => v,
-                None => {
-                    if spec.is_workspace() {
-                        eprintln!(
-                            "Warning: Could not resolve workspace dependency '{}' - workspace root not found or dependency not defined",
-                            name
-                        );
+                // Get current version - resolve from workspace if needed
+                let version_str = match Self::resolve_version_static(&name, &spec, workspace_ctx) {
+                    Some(v) => v,
+                    None => {
+                        if spec.is_workspace() {
+                            warnings.lock().unwrap().push(format!(
+                                "Warning: Could not resolve workspace dependency '{}' - workspace root not found or dependency not defined",
+                                name
+                            ));
+                        }
+                        pb.inc(1);
+                        return None;
                     }
-                    pb.inc(1);
-                    continue;
-                }
-            };
+                };
 
-            // Parse version requirement (remove ^, ~, etc)
-            let current_version = match parse_version_req(&version_str) {
-                Some(v) => v,
-                None => {
-                    eprintln!(
-                        "Warning: Could not parse version '{}' for {}",
-                        version_str, name
-                    );
-                    pb.inc(1);
-                    continue;
-                }
-            };
+                // Parse version requirement (remove ^, ~, etc)
+                let current_version = match parse_version_req(&version_str) {
+                    Some(v) => v,
+                    None => {
+                        warnings.lock().unwrap().push(format!(
+                            "Warning: Could not parse version '{}' for {}",
+                            version_str, name
+                        ));
+                        pb.inc(1);
+                        return None;
+                    }
+                };
 
-            // Fetch latest version from crates.io
-            let latest_version = match self.client.get_latest_version(&name) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    eprintln!("Warning: Failed to fetch info for {}: {}", name, e);
-                    None
-                }
-            };
+                Some((name, spec, current_version))
+            })
+            .collect();
 
-            // Mark if this dependency is workspace-inherited
-            let mut dep = Dependency::new(name.clone(), current_version, true);
-            if spec.is_workspace() {
-                dep = dep.with_workspace_inherited(true);
+        // Process dependencies in parallel - this is where the HTTP calls happen
+        let results: Vec<Dependency> = dep_infos
+            .par_iter()
+            .filter_map(|(name, spec, current_version)| {
+                // Fetch latest version from crates.io (parallel HTTP requests)
+                let latest_version = match self.client.get_latest_version(name) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        warnings.lock().unwrap().push(format!(
+                            "Warning: Failed to fetch info for {}: {}",
+                            name, e
+                        ));
+                        None
+                    }
+                };
+
+                // Mark if this dependency is workspace-inherited
+                let mut dep = Dependency::new(name.clone(), current_version.clone(), true);
+                if spec.is_workspace() {
+                    dep = dep.with_workspace_inherited(true);
+                }
+                if let Some(latest) = latest_version {
+                    dep = dep.with_latest(latest);
+                }
+
+                pb.inc(1);
+                Some(dep)
+            })
+            .collect();
+
+        pb.finish_and_clear();
+
+        // Print warnings after progress bar is done (only in standalone mode)
+        if multi_progress.is_none() {
+            for warning in warnings.into_inner().unwrap() {
+                eprintln!("{}", warning);
             }
-            if let Some(latest) = latest_version {
-                dep = dep.with_latest(latest);
-            }
-
-            results.push(dep);
-            pb.inc(1);
+            println!();
         }
-
-        pb.finish_with_message("Done");
-        println!();
 
         Ok(results)
     }
 
-    /// Resolve the version string for a dependency, handling workspace inheritance
-    fn resolve_version(
-        &self,
+    /// Static version of resolve_version for use in closures
+    fn resolve_version_static(
         name: &str,
         spec: &DependencySpec,
         workspace_ctx: &WorkspaceContext,
@@ -134,6 +182,7 @@ impl DependencyChecker {
             DependencySpec::Workspace { workspace: false } => None,
         }
     }
+
 }
 
 impl Default for DependencyChecker {
