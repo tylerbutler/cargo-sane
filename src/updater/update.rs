@@ -121,10 +121,14 @@ impl DependencyUpdater {
     }
 
     /// Save the updated Cargo.toml(s)
-    pub fn save(&self) -> Result<()> {
+    ///
+    /// If `no_backup` is true, skips creating backup files (useful when files are in source control).
+    pub fn save(&self, no_backup: bool) -> Result<()> {
         // Create backup and save member manifest
-        let backup_path = self.manifest.path.with_extension("toml.backup");
-        fs::copy(&self.manifest.path, &backup_path).context("Failed to create backup")?;
+        if !no_backup {
+            let backup_path = self.manifest.path.with_extension("toml.backup");
+            fs::copy(&self.manifest.path, &backup_path).context("Failed to create backup")?;
+        }
 
         fs::write(&self.manifest.path, &self.original_content)
             .context("Failed to write updated Cargo.toml")?;
@@ -132,8 +136,10 @@ impl DependencyUpdater {
         // Save workspace root if it was modified
         if let (Some(ref content), Some(ref path)) = (&self.workspace_content, &self.workspace_path)
         {
-            let backup_path = path.with_extension("toml.backup");
-            fs::copy(path, &backup_path).context("Failed to create workspace backup")?;
+            if !no_backup {
+                let backup_path = path.with_extension("toml.backup");
+                fs::copy(path, &backup_path).context("Failed to create workspace backup")?;
+            }
 
             fs::write(path, content).context("Failed to write updated workspace Cargo.toml")?;
         }

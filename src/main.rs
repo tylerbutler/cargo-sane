@@ -51,6 +51,10 @@ enum Commands {
         /// Update all workspace members
         #[arg(short, long)]
         workspace: bool,
+
+        /// Skip creating backup files (assumes files are in source control)
+        #[arg(long)]
+        no_backup: bool,
     },
 
     /// Fix dependency conflicts
@@ -117,7 +121,8 @@ fn main() -> Result<()> {
             dry_run,
             all,
             workspace,
-        } => commands::update_command(manifest_path, dry_run, all, workspace),
+            no_backup,
+        } => commands::update_command(manifest_path, dry_run, all, workspace, no_backup),
         Commands::Fix {
             manifest_path,
             auto,

@@ -398,6 +398,7 @@ pub fn update_command(
     dry_run: bool,
     all: bool,
     workspace: bool,
+    no_backup: bool,
 ) -> Result<()> {
     output::print_header("🧠 cargo-sane update");
     println!();
@@ -410,10 +411,10 @@ pub fn update_command(
 
     if workspace && workspace_ctx.is_workspace() {
         // Workspace-wide update
-        update_workspace(&workspace_ctx, dry_run, all)
+        update_workspace(&workspace_ctx, dry_run, all, no_backup)
     } else {
         // Single manifest update
-        update_single_manifest(&manifest, &workspace_ctx, dry_run, all)
+        update_single_manifest(&manifest, &workspace_ctx, dry_run, all, no_backup)
     }
 }
 
@@ -422,6 +423,7 @@ fn update_single_manifest(
     workspace_ctx: &WorkspaceContext,
     dry_run: bool,
     all: bool,
+    no_backup: bool,
 ) -> Result<()> {
     if let Some(name) = manifest.package_name() {
         output::print_info(&format!("Package: {}", name));
@@ -545,16 +547,18 @@ fn update_single_manifest(
     // Save changes
     let workspace_modified = updater.workspace_modified();
     let workspace_path = updater.workspace_root_path().cloned();
-    updater.save()?;
+    updater.save(no_backup)?;
     println!();
     output::print_success("Cargo.toml updated successfully!");
-    output::print_info("Backup saved as Cargo.toml.backup");
-    if workspace_modified {
-        if let Some(path) = workspace_path {
-            output::print_info(&format!(
-                "Workspace root backup saved as {}",
-                path.with_extension("toml.backup").display()
-            ));
+    if !no_backup {
+        output::print_info("Backup saved as Cargo.toml.backup");
+        if workspace_modified {
+            if let Some(path) = workspace_path {
+                output::print_info(&format!(
+                    "Workspace root backup saved as {}",
+                    path.with_extension("toml.backup").display()
+                ));
+            }
         }
     }
     println!();
@@ -566,7 +570,12 @@ fn update_single_manifest(
     Ok(())
 }
 
-fn update_workspace(workspace_ctx: &WorkspaceContext, dry_run: bool, all: bool) -> Result<()> {
+fn update_workspace(
+    workspace_ctx: &WorkspaceContext,
+    dry_run: bool,
+    all: bool,
+    no_backup: bool,
+) -> Result<()> {
     let workspace_root = workspace_ctx
         .root
         .as_ref()
@@ -705,8 +714,10 @@ fn update_workspace(workspace_ctx: &WorkspaceContext, dry_run: bool, all: bool) 
         }
 
         // Save the workspace root changes
-        let backup_path = workspace_root.path.with_extension("toml.backup");
-        std::fs::copy(&workspace_root.path, &backup_path).context("Failed to create backup")?;
+        if !no_backup {
+            let backup_path = workspace_root.path.with_extension("toml.backup");
+            std::fs::copy(&workspace_root.path, &backup_path).context("Failed to create backup")?;
+        }
         std::fs::write(&workspace_root.path, &root_content)
             .context("Failed to write workspace root")?;
 
@@ -765,8 +776,10 @@ fn update_workspace(workspace_ctx: &WorkspaceContext, dry_run: bool, all: bool) 
             }
 
             // Save the member manifest changes
-            let backup_path = manifest_path.with_extension("toml.backup");
-            std::fs::copy(&manifest_path, &backup_path).context("Failed to create backup")?;
+            if !no_backup {
+                let backup_path = manifest_path.with_extension("toml.backup");
+                std::fs::copy(&manifest_path, &backup_path).context("Failed to create backup")?;
+            }
             std::fs::write(&manifest_path, &content).context("Failed to write member manifest")?;
         }
     }
