@@ -3,6 +3,8 @@
 use anyhow::{Context, Result};
 use semver::Version;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::RwLock;
 use std::time::Duration;
 
 const CRATES_IO_API: &str = "https://crates.io/api/v1";
@@ -35,6 +37,8 @@ pub struct VersionInfo {
 
 pub struct CratesIoClient {
     client: reqwest::blocking::Client,
+    /// Cache for latest version lookups (crate_name -> version)
+    version_cache: RwLock<HashMap<String, Version>>,
 }
 
 impl CratesIoClient {
@@ -45,11 +49,33 @@ impl CratesIoClient {
             .build()
             .context("Failed to create HTTP client")?;
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            version_cache: RwLock::new(HashMap::new()),
+        })
     }
 
-    /// Get the latest version of a crate
+    /// Get the latest version of a crate (cached)
     pub fn get_latest_version(&self, crate_name: &str) -> Result<Version> {
+        // Check cache first (read lock)
+        if let Some(version) = self.version_cache.read().unwrap().get(crate_name) {
+            return Ok(version.clone());
+        }
+
+        // Cache miss - fetch from API
+        let version = self.fetch_latest_version(crate_name)?;
+
+        // Store in cache (write lock)
+        self.version_cache
+            .write()
+            .unwrap()
+            .insert(crate_name.to_string(), version.clone());
+
+        Ok(version)
+    }
+
+    /// Fetch latest version from crates.io API (uncached)
+    fn fetch_latest_version(&self, crate_name: &str) -> Result<Version> {
         let url = format!("{}/crates/{}", CRATES_IO_API, crate_name);
 
         let response = self

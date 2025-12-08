@@ -35,7 +35,7 @@ thiserror = "2.0.17"
 semver = { version = "1.0.27", features = ["serde"] }
 
 # Parallelism
-rayon = "1.10"
+rayon = "1.11.0"
 
 # Async runtime (for future use)
 tokio = { version = "1.47.2", features = ["full"], optional = true }
