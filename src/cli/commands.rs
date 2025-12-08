@@ -7,9 +7,19 @@ use crate::core::manifest::Manifest;
 use crate::core::workspace::WorkspaceContext;
 use crate::updater::DependencyUpdater;
 use crate::Result;
+use anyhow::Context;
 use colored::Colorize;
 use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect};
 use std::collections::HashMap;
+use std::path::PathBuf;
+
+/// Tracks which member manifest uses a particular dependency
+#[derive(Debug, Clone)]
+struct MemberDepInfo {
+    #[allow(dead_code)]
+    package_name: String,
+    manifest_path: PathBuf,
+}
 
 /// Aggregated dependency info for workspace-wide analysis
 #[derive(Debug, Clone)]
@@ -17,6 +27,8 @@ struct AggregatedDep {
     dep: Dependency,
     /// Which packages use this dependency
     used_by: Vec<String>,
+    /// For member-specific (non-workspace) deps, track which manifests contain them
+    member_manifests: Vec<MemberDepInfo>,
 }
 
 pub fn check_command(manifest_path: Option<String>, verbose: bool, workspace: bool) -> Result<()> {
@@ -151,18 +163,39 @@ fn aggregate_workspace_deps(
 
         for dep in deps {
             let key = dep.name.clone();
+            let is_workspace_inherited = dep.is_workspace_inherited;
+            let manifest_path = manifest.path.clone();
+
             aggregated
                 .entry(key)
                 .and_modify(|agg| {
                     agg.used_by.push(package_name.clone());
+                    // Track member manifests for non-workspace deps
+                    if !is_workspace_inherited {
+                        agg.member_manifests.push(MemberDepInfo {
+                            package_name: package_name.clone(),
+                            manifest_path: manifest_path.clone(),
+                        });
+                    }
                     // Keep the one with update info if available
                     if dep.latest_version.is_some() && agg.dep.latest_version.is_none() {
                         agg.dep = dep.clone();
                     }
                 })
-                .or_insert(AggregatedDep {
-                    dep,
-                    used_by: vec![package_name.clone()],
+                .or_insert_with(|| {
+                    let member_manifests = if is_workspace_inherited {
+                        vec![]
+                    } else {
+                        vec![MemberDepInfo {
+                            package_name: package_name.clone(),
+                            manifest_path: manifest_path.clone(),
+                        }]
+                    };
+                    AggregatedDep {
+                        dep,
+                        used_by: vec![package_name.clone()],
+                        member_manifests,
+                    }
                 });
         }
     }
@@ -569,12 +602,11 @@ fn update_workspace(workspace_ctx: &WorkspaceContext, dry_run: bool, all: bool) 
         updatable.len()
     );
 
-    // Select which dependencies to update
-    let to_update: Vec<&Dependency> = if all {
-        updatable.iter().map(|a| &a.dep).collect()
+    // Select which dependencies to update (keep AggregatedDep to access member_manifests)
+    let to_update: Vec<&AggregatedDep> = if all {
+        updatable.into_iter().collect()
     } else {
-        let deps: Vec<&Dependency> = updatable.iter().map(|a| &a.dep).collect();
-        select_dependencies_to_update(&deps)?
+        select_aggregated_deps_to_update(&updatable)?
     };
 
     if to_update.is_empty() {
@@ -584,7 +616,8 @@ fn update_workspace(workspace_ctx: &WorkspaceContext, dry_run: bool, all: bool) 
 
     // Show what will be updated
     println!("\n{}", "📝 Updates to apply:".bold());
-    for dep in &to_update {
+    for agg in &to_update {
+        let dep = &agg.dep;
         if let Some(latest) = &dep.latest_version {
             let update_type = match dep.update_type() {
                 UpdateType::Patch => "🟢 PATCH",
@@ -595,7 +628,8 @@ fn update_workspace(workspace_ctx: &WorkspaceContext, dry_run: bool, all: bool) 
             let ws_marker = if dep.is_workspace_inherited {
                 " [workspace]".dimmed().to_string()
             } else {
-                String::new()
+                let member_count = agg.member_manifests.len();
+                format!(" [{} member(s)]", member_count).dimmed().to_string()
             };
             println!(
                 "  {} {}{} {} → {}",
@@ -633,29 +667,30 @@ fn update_workspace(workspace_ctx: &WorkspaceContext, dry_run: bool, all: bool) 
     }
 
     // For workspace updates, we need to update both workspace root and members
-    // For now, focus on workspace dependencies (updating workspace root)
     println!("\n{}", "🔄 Applying updates...".bold());
 
     // Group by whether workspace-inherited or not
-    let (workspace_deps, member_deps): (Vec<&&Dependency>, Vec<&&Dependency>) = to_update
+    let (workspace_aggs, member_aggs): (Vec<&&AggregatedDep>, Vec<&&AggregatedDep>) = to_update
         .iter()
-        .partition(|d| d.is_workspace_inherited);
+        .partition(|a| a.dep.is_workspace_inherited);
 
     // Update workspace dependencies in root
-    if !workspace_deps.is_empty() {
+    if !workspace_aggs.is_empty() {
         // Create a manifest for the workspace root to use the updater
         let root_manifest = Manifest::from_path(&workspace_root.path)?;
-        let root_updater = DependencyUpdater::new(root_manifest)?;
+        let mut root_content =
+            std::fs::read_to_string(&workspace_root.path).context("Failed to read workspace root")?;
 
-        for dep in workspace_deps {
+        for agg in &workspace_aggs {
+            let dep = &agg.dep;
             if let Some(latest) = &dep.latest_version {
-                // For workspace deps, update directly in root
                 match DependencyUpdater::update_version_in_content(
-                    root_updater.get_content(),
+                    &root_content,
                     &dep.name,
                     &latest.to_string(),
                 ) {
-                    Ok(_) => {
+                    Ok(updated) => {
+                        root_content = updated;
                         println!(
                             "  ✓ Updated {} to {} [workspace root]",
                             dep.name.green(),
@@ -668,14 +703,72 @@ fn update_workspace(workspace_ctx: &WorkspaceContext, dry_run: bool, all: bool) 
                 }
             }
         }
+
+        // Save the workspace root changes
+        let backup_path = workspace_root.path.with_extension("toml.backup");
+        std::fs::copy(&workspace_root.path, &backup_path).context("Failed to create backup")?;
+        std::fs::write(&workspace_root.path, &root_content)
+            .context("Failed to write workspace root")?;
+
+        // Drop the unused manifest binding
+        let _ = root_manifest;
     }
 
     // Update member-specific dependencies
-    if !member_deps.is_empty() {
-        output::print_warning(
-            "Member-specific dependency updates require updating each member's Cargo.toml individually.",
-        );
-        output::print_info("Use `cargo sane update` in each member directory for non-workspace deps.");
+    if !member_aggs.is_empty() {
+        // Group updates by manifest path
+        let mut updates_by_manifest: HashMap<PathBuf, Vec<(&str, String)>> = HashMap::new();
+
+        for agg in &member_aggs {
+            let dep = &agg.dep;
+            if let Some(latest) = &dep.latest_version {
+                for member_info in &agg.member_manifests {
+                    updates_by_manifest
+                        .entry(member_info.manifest_path.clone())
+                        .or_default()
+                        .push((&dep.name, latest.to_string()));
+                }
+            }
+        }
+
+        // Apply updates to each member manifest
+        for (manifest_path, updates) in updates_by_manifest {
+            let mut content =
+                std::fs::read_to_string(&manifest_path).context("Failed to read member manifest")?;
+            let member_name = manifest_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+
+            for (dep_name, new_version) in &updates {
+                match DependencyUpdater::update_version_in_content(&content, dep_name, new_version)
+                {
+                    Ok(updated) => {
+                        content = updated;
+                        println!(
+                            "  ✓ Updated {} to {} [{}]",
+                            dep_name.green(),
+                            new_version.cyan(),
+                            member_name.dimmed()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "  ✗ Failed to update {} in {}: {}",
+                            dep_name.red(),
+                            member_name,
+                            e
+                        );
+                    }
+                }
+            }
+
+            // Save the member manifest changes
+            let backup_path = manifest_path.with_extension("toml.backup");
+            std::fs::copy(&manifest_path, &backup_path).context("Failed to create backup")?;
+            std::fs::write(&manifest_path, &content).context("Failed to write member manifest")?;
+        }
     }
 
     println!();
@@ -721,6 +814,45 @@ fn select_dependencies_to_update<'a>(deps: &[&'a Dependency]) -> Result<Vec<&'a 
         .interact()?;
 
     let selected: Vec<&Dependency> = selections.iter().map(|&i| deps[i]).collect();
+    Ok(selected)
+}
+
+/// Interactive selection of aggregated dependencies to update (for workspace mode)
+fn select_aggregated_deps_to_update<'a>(
+    aggs: &[&'a AggregatedDep],
+) -> Result<Vec<&'a AggregatedDep>> {
+    let items: Vec<String> = aggs
+        .iter()
+        .map(|a| {
+            let d = &a.dep;
+            let update_type = match d.update_type() {
+                UpdateType::Patch => "🟢",
+                UpdateType::Minor => "🟡",
+                UpdateType::Major => "🔴",
+                UpdateType::UpToDate => "✅",
+            };
+            let ws_marker = if d.is_workspace_inherited {
+                " [ws]".to_string()
+            } else {
+                format!(" [{}m]", a.member_manifests.len())
+            };
+            format!(
+                "{} {}{} {} → {}",
+                update_type,
+                d.name,
+                ws_marker,
+                d.current_version,
+                d.latest_version.as_ref().unwrap()
+            )
+        })
+        .collect();
+
+    let selections = MultiSelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select dependencies to update (Space to select, Enter to confirm)")
+        .items(&items)
+        .interact()?;
+
+    let selected: Vec<&AggregatedDep> = selections.iter().map(|&i| aggs[i]).collect();
     Ok(selected)
 }
 
