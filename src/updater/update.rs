@@ -41,9 +41,6 @@ impl DependencyUpdater {
             (None, None)
         };
 
-        // workspace_ctx is used for detection, but we only need the paths after
-        let _ = &workspace_ctx; // Acknowledge usage
-
         Ok(Self {
             manifest,
             original_content,

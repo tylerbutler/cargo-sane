@@ -34,6 +34,15 @@ struct AggregatedDep {
     member_manifests: Vec<MemberDepInfo>,
 }
 
+/// Format a workspace marker for display
+fn workspace_marker(is_inherited: bool) -> String {
+    if is_inherited {
+        " [workspace]".dimmed().to_string()
+    } else {
+        String::new()
+    }
+}
+
 pub fn check_command(manifest_path: Option<String>, verbose: bool, workspace: bool) -> Result<()> {
     output::print_header("🧠 cargo-sane check");
     println!();
@@ -111,14 +120,12 @@ fn check_workspace(workspace_ctx: &WorkspaceContext, verbose: bool) -> Result<()
     let members = workspace_root.get_member_manifests()?;
     output::print_info(&format!("Members: {}", members.len()));
 
-    // List member names
-    let member_names: Vec<_> = members
-        .iter()
-        .filter_map(|m| m.package_name())
-        .collect();
+    // List member names if verbose
     if verbose {
-        for name in &member_names {
-            println!("  • {}", name);
+        for manifest in &members {
+            if let Some(name) = manifest.package_name() {
+                println!("  • {}", name);
+            }
         }
     }
     println!();
@@ -132,11 +139,9 @@ fn check_workspace(workspace_ctx: &WorkspaceContext, verbose: bool) -> Result<()
         return Ok(());
     }
 
-    // Convert to flat list for display
-    let all_deps: Vec<&Dependency> = aggregated.values().map(|a| &a.dep).collect();
     print_workspace_dependency_summary(&aggregated, verbose);
 
-    if all_deps.iter().all(|d| !d.has_update()) {
+    if aggregated.values().all(|a| !a.dep.has_update()) {
         output::print_success("All workspace dependencies are up to date! 🎉");
     } else {
         println!(
@@ -156,7 +161,6 @@ fn aggregate_workspace_deps(
 ) -> Result<HashMap<String, AggregatedDep>> {
     // Use a Mutex-wrapped HashMap for thread-safe aggregation
     let aggregated: Mutex<HashMap<String, AggregatedDep>> = Mutex::new(HashMap::new());
-    let warnings: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     // Create MultiProgress for coordinated progress bar display
     let multi_progress = MultiProgress::new();
@@ -223,11 +227,6 @@ fn aggregate_workspace_deps(
 
     // Clear all progress bars
     multi_progress.clear().ok();
-
-    // Print any collected warnings
-    for warning in warnings.into_inner().unwrap() {
-        eprintln!("{}", warning);
-    }
 
     // Return first error if any occurred
     if let Some(err) = errors.into_iter().next() {
@@ -363,15 +362,10 @@ where
     println!("{}", header.bold());
     for dep in deps {
         if let Some(latest) = &dep.latest_version {
-            let ws_marker = if dep.is_workspace_inherited {
-                " [workspace]".dimmed().to_string()
-            } else {
-                String::new()
-            };
             println!(
                 "  • {}{} {} → {}",
                 dep.name.bold(),
-                ws_marker,
+                workspace_marker(dep.is_workspace_inherited),
                 dep.current_version.to_string().dimmed(),
                 colorize(latest.to_string())
             );
@@ -405,16 +399,11 @@ fn print_workspace_update_list<F>(
     for agg in deps {
         let dep = &agg.dep;
         if let Some(latest) = &dep.latest_version {
-            let ws_marker = if dep.is_workspace_inherited {
-                " [workspace]".dimmed().to_string()
-            } else {
-                String::new()
-            };
             let usage = format!(" (used by {} crates)", agg.used_by.len());
             println!(
                 "  • {}{}{} {} → {}",
                 dep.name.bold(),
-                ws_marker,
+                workspace_marker(dep.is_workspace_inherited),
                 usage.dimmed(),
                 dep.current_version.to_string().dimmed(),
                 colorize(latest.to_string())
@@ -514,16 +503,11 @@ fn update_single_manifest(
                 UpdateType::Major => "🔴 MAJOR",
                 UpdateType::UpToDate => "✅ UP-TO-DATE",
             };
-            let ws_marker = if dep.is_workspace_inherited {
-                " [workspace]".dimmed().to_string()
-            } else {
-                String::new()
-            };
             println!(
                 "  {} {}{} {} → {}",
                 update_type,
                 dep.name.bold(),
-                ws_marker,
+                workspace_marker(dep.is_workspace_inherited),
                 dep.current_version.to_string().dimmed(),
                 latest.to_string().cyan()
             );
@@ -719,8 +703,6 @@ fn update_workspace(
 
     // Update workspace dependencies in root
     if !workspace_aggs.is_empty() {
-        // Create a manifest for the workspace root to use the updater
-        let root_manifest = Manifest::from_path(&workspace_root.path)?;
         let mut root_content =
             std::fs::read_to_string(&workspace_root.path).context("Failed to read workspace root")?;
 
@@ -754,9 +736,6 @@ fn update_workspace(
         }
         std::fs::write(&workspace_root.path, &root_content)
             .context("Failed to write workspace root")?;
-
-        // Drop the unused manifest binding
-        let _ = root_manifest;
     }
 
     // Update member-specific dependencies
