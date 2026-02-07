@@ -16,6 +16,7 @@
 - 🎨 **Beautiful Output** - Color-coded, easy-to-read terminal interface
 - 💾 **Safe Updates** - Automatic backup before making changes
 - 🚀 **Fast** - Concurrent API calls with progress indicators
+- 📦 **Workspace Support** - Analyze and update entire workspaces with `--workspace` flag
 
 ## 📦 Installation
 ```bash
@@ -102,6 +103,29 @@ cargo sane check --manifest-path /path/to/Cargo.toml
 cargo sane update --manifest-path /path/to/Cargo.toml
 ```
 
+### Workspace Support
+
+Analyze all members of a workspace:
+```bash
+cargo sane check --workspace
+```
+
+Update dependencies across the entire workspace:
+```bash
+cargo sane update --workspace
+```
+
+Workspace mode:
+- Aggregates dependencies across all workspace members
+- Shows which crates use each dependency
+- Updates `[workspace.dependencies]` in the root Cargo.toml for inherited deps
+- Updates member Cargo.toml files for member-specific deps
+
+**Skip backups (for version-controlled projects):**
+```bash
+cargo sane update --no-backup
+```
+
 ## 📋 Commands
 
 | Command | Description | Status |
@@ -150,6 +174,16 @@ clap = { version = "4.5", optional = true }
 
 # With comments (preserved!)
 regex = "1.11"  # For pattern matching
+
+# Workspace inheritance (resolved automatically)
+anyhow.workspace = true
+```
+
+Workspace root `[workspace.dependencies]` are also supported:
+```toml
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+tokio = "1.35"
 ```
 
 ## 🎯 Roadmap
@@ -158,12 +192,12 @@ regex = "1.11"  # For pattern matching
 - [x] Update categorization (patch/minor/major)
 - [x] Interactive dependency updates
 - [x] Beautiful terminal output
+- [x] Workspace support
 - [ ] Conflict resolution
 - [ ] Security vulnerability scanning (RustSec integration)
 - [ ] Unused dependency detection
 - [ ] CI/CD integration (GitHub Actions)
 - [ ] Configuration file support
-- [ ] Workspace support
 
 ## 🤝 Contributing
 

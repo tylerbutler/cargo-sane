@@ -1,4 +1,11 @@
-//! Command implementations
+//! Command implementations for cargo-sane CLI.
+//!
+//! This module contains the implementation of all CLI commands:
+//! - `check`: Analyze dependencies and show available updates
+//! - `update`: Update dependencies interactively
+//! - `fix`: Fix dependency conflicts (not yet implemented)
+//! - `clean`: Remove unused dependencies (not yet implemented)
+//! - `health`: Check dependency health (not yet implemented)
 
 use crate::analyzer::checker::DependencyChecker;
 use crate::cli::output;
@@ -16,31 +23,66 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-/// Tracks which member manifest uses a particular dependency
+/// Tracks which member manifest contains a dependency.
+///
+/// Used during workspace-wide updates to know which member Cargo.toml files
+/// need to be modified for member-specific (non-workspace) dependencies.
 #[derive(Debug, Clone)]
 struct MemberDepInfo {
-    #[allow(dead_code)]
-    package_name: String,
     manifest_path: PathBuf,
 }
 
-/// Aggregated dependency info for workspace-wide analysis
+/// Aggregated dependency info for workspace-wide analysis.
+///
+/// When analyzing a workspace, the same dependency may appear in multiple
+/// member crates. This struct aggregates that information to provide a
+/// unified view and enable efficient updates.
 #[derive(Debug, Clone)]
 struct AggregatedDep {
+    /// The dependency with version information
     dep: Dependency,
-    /// Which packages use this dependency
+    /// Names of packages that use this dependency
     used_by: Vec<String>,
-    /// For member-specific (non-workspace) deps, track which manifests contain them
+    /// For member-specific (non-workspace) deps, the manifests that contain them
     member_manifests: Vec<MemberDepInfo>,
 }
 
-/// Format a workspace marker for display
+/// Format a workspace marker for display (e.g., " [workspace]" or "").
 fn workspace_marker(is_inherited: bool) -> String {
     if is_inherited {
         " [workspace]".dimmed().to_string()
     } else {
         String::new()
     }
+}
+
+/// Format a workspace marker with member count for aggregated dependencies.
+///
+/// Returns " [workspace]" for inherited deps or " [N member(s)]" for member-specific deps.
+fn aggregated_marker(dep: &Dependency, member_count: usize) -> String {
+    if dep.is_workspace_inherited {
+        " [workspace]".dimmed().to_string()
+    } else {
+        format!(" [{} member(s)]", member_count).dimmed().to_string()
+    }
+}
+
+/// Print common manifest header info (package name, path, workspace info).
+fn print_manifest_header(manifest: &Manifest, workspace_ctx: &WorkspaceContext) {
+    if let Some(name) = manifest.package_name() {
+        output::print_info(&format!("Package: {}", name));
+    }
+    output::print_info(&format!("Manifest: {}", manifest.path.display()));
+
+    if workspace_ctx.is_workspace() {
+        if let Some(root_path) = workspace_ctx.workspace_root_path() {
+            output::print_info(&format!(
+                "Workspace: {}",
+                root_path.parent().unwrap_or(root_path).display()
+            ));
+        }
+    }
+    println!();
 }
 
 pub fn check_command(manifest_path: Option<String>, verbose: bool, workspace: bool) -> Result<()> {
@@ -67,20 +109,7 @@ fn check_single_manifest(
     workspace_ctx: &WorkspaceContext,
     verbose: bool,
 ) -> Result<()> {
-    if let Some(name) = manifest.package_name() {
-        output::print_info(&format!("Package: {}", name));
-    }
-    output::print_info(&format!("Manifest: {}", manifest.path.display()));
-
-    if workspace_ctx.is_workspace() {
-        if let Some(root_path) = workspace_ctx.workspace_root_path() {
-            output::print_info(&format!(
-                "Workspace: {}",
-                root_path.parent().unwrap_or(root_path).display()
-            ));
-        }
-    }
-    println!();
+    print_manifest_header(manifest, workspace_ctx);
 
     // Check dependencies
     let checker = DependencyChecker::new()?;
@@ -195,7 +224,6 @@ fn aggregate_workspace_deps(
                         // Track member manifests for non-workspace deps
                         if !is_workspace_inherited {
                             entry.member_manifests.push(MemberDepInfo {
-                                package_name: package_name.clone(),
                                 manifest_path: manifest_path.clone(),
                             });
                         }
@@ -209,7 +237,6 @@ fn aggregate_workspace_deps(
                             vec![]
                         } else {
                             vec![MemberDepInfo {
-                                package_name: package_name.clone(),
                                 manifest_path: manifest_path.clone(),
                             }]
                         };
@@ -448,20 +475,7 @@ fn update_single_manifest(
     all: bool,
     no_backup: bool,
 ) -> Result<()> {
-    if let Some(name) = manifest.package_name() {
-        output::print_info(&format!("Package: {}", name));
-    }
-    output::print_info(&format!("Manifest: {}", manifest.path.display()));
-
-    if workspace_ctx.is_workspace() {
-        if let Some(root_path) = workspace_ctx.workspace_root_path() {
-            output::print_info(&format!(
-                "Workspace: {}",
-                root_path.parent().unwrap_or(root_path).display()
-            ));
-        }
-    }
-    println!();
+    print_manifest_header(manifest, workspace_ctx);
 
     // Check dependencies
     let checker = DependencyChecker::new()?;
@@ -652,17 +666,11 @@ fn update_workspace(
                 UpdateType::Major => "🔴 MAJOR",
                 UpdateType::UpToDate => "✅ UP-TO-DATE",
             };
-            let ws_marker = if dep.is_workspace_inherited {
-                " [workspace]".dimmed().to_string()
-            } else {
-                let member_count = agg.member_manifests.len();
-                format!(" [{} member(s)]", member_count).dimmed().to_string()
-            };
             println!(
                 "  {} {}{} {} → {}",
                 update_type,
                 dep.name.bold(),
-                ws_marker,
+                aggregated_marker(dep, agg.member_manifests.len()),
                 dep.current_version.to_string().dimmed(),
                 latest.to_string().cyan()
             );

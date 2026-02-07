@@ -8,7 +8,7 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 const CRATES_IO_API: &str = "https://crates.io/api/v1";
-const USER_AGENT: &str = "cargo-sane (https://github.com/yourusername/cargo-sane)";
+const USER_AGENT: &str = "cargo-sane (https://github.com/chronocoders/cargo-sane)";
 
 #[derive(Debug, Deserialize)]
 pub struct CrateResponse {

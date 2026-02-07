@@ -11,7 +11,8 @@ use std::path::PathBuf;
 
 pub struct DependencyUpdater {
     manifest: Manifest,
-    original_content: String,
+    /// Current content of the manifest (modified during updates)
+    content: String,
     /// Content of workspace root Cargo.toml (if different from manifest)
     workspace_content: Option<String>,
     /// Path to workspace root Cargo.toml
@@ -20,7 +21,7 @@ pub struct DependencyUpdater {
 
 impl DependencyUpdater {
     pub fn new(manifest: Manifest) -> Result<Self> {
-        let original_content =
+        let content =
             fs::read_to_string(&manifest.path).context("Failed to read Cargo.toml")?;
 
         // Create workspace context
@@ -43,7 +44,7 @@ impl DependencyUpdater {
 
         Ok(Self {
             manifest,
-            original_content,
+            content,
             workspace_content,
             workspace_path,
         })
@@ -63,8 +64,8 @@ impl DependencyUpdater {
 
     /// Update a dependency in the local manifest
     fn update_local_dependency(&mut self, dep_name: &str, new_version: &str) -> Result<()> {
-        self.original_content =
-            Self::update_version_in_content(&self.original_content, dep_name, new_version)?;
+        self.content =
+            Self::update_version_in_content(&self.content, dep_name, new_version)?;
         Ok(())
     }
 
@@ -127,7 +128,7 @@ impl DependencyUpdater {
             fs::copy(&self.manifest.path, &backup_path).context("Failed to create backup")?;
         }
 
-        fs::write(&self.manifest.path, &self.original_content)
+        fs::write(&self.manifest.path, &self.content)
             .context("Failed to write updated Cargo.toml")?;
 
         // Save workspace root if it was modified
@@ -160,7 +161,7 @@ impl DependencyUpdater {
 
     /// Get the current content (for dry-run)
     pub fn get_content(&self) -> &str {
-        &self.original_content
+        &self.content
     }
 
     /// Get the workspace content (for dry-run)

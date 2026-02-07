@@ -37,8 +37,6 @@ semver = { version = "1.0.27", features = ["serde"] }
 # Parallelism
 rayon = "1.11.0"
 
-# Async runtime (for future use)
-tokio = { version = "1.47.2", features = ["full"], optional = true }
 regex = "1.12.2"
 glob = "0.3.3"
 
